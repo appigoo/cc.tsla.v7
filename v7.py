@@ -1878,12 +1878,22 @@ with tabs[-1]:
             "- 勝率數據僅反映歷史規律，短週期市場結構變化快，請謹慎使用"
         )
 
-    col_a, col_b, col_c, col_d = st.columns(4)
+    col_a, col_b, col_c = st.columns(3)
     bt_min    = col_a.number_input("最少信號組合數", 2, 3, int(BT_MIN_COMBO), 1, key="bt_min")
     bt_max    = col_b.number_input("最多信號組合數", 2, 5, int(BT_MAX_COMBO), 1, key="bt_max")
     bt_occ    = col_c.number_input("最少出現次數",   2, 20, int(BT_MIN_OCC),  1, key="bt_occ")
-    bt_wr_thr = col_d.number_input("高勝率閾值 (%)", 50, 95, 60, 5, key="bt_wr_thr",
-                                    help="高於此值才列入高勝率區，並可一鍵加入 Telegram 條件")
+
+    col_d, col_e, _ = st.columns([1, 1, 1])
+    bt_wr_thr  = col_d.number_input(
+        "高勝率閾值 (%)", 50, 95, 60, 5, key="bt_wr_thr",
+        help="高於此值才列入高勝率區，並可一鍵加入 Telegram 條件",
+    )
+    bt_pnl_thr = col_e.number_input(
+        "最低平均盈虧 (%)", -10.0, 20.0, 0.0, 0.1,
+        key="bt_pnl_thr",
+        format="%.1f",
+        help="同時滿足勝率閾值 且 平均盈虧 ≥ 此值才列入高勝率區。設為 0 = 不限制負盈虧",
+    )
 
     if st.button("🚀 開始回測", type="primary"):
         with st.spinner(f"正在計算 {bt_ticker}（{bt_period} / {bt_interval}）三維勝率，稍候…"):
@@ -1965,6 +1975,7 @@ with tabs[-1]:
                 st.session_state["bt_df_vol"]      = df_vol
                 st.session_state["bt_df_kl"]       = df_kl
                 st.session_state["_result_wr_thr"]      = int(bt_wr_thr)
+                st.session_state["_result_pnl_thr"]    = float(bt_pnl_thr)
                 st.session_state["_result_ticker"]  = bt_ticker
                 st.session_state["_result_period"]  = bt_period
                 st.session_state["_result_interval"]= bt_interval
@@ -1981,6 +1992,7 @@ with tabs[-1]:
         df_vol  = st.session_state["bt_df_vol"]
         df_kl   = st.session_state["bt_df_kl"]
         _wr_thr          = st.session_state.get("_result_wr_thr", 60)
+        _pnl_thr         = st.session_state.get("_result_pnl_thr", 0.0)
         _bt_lbl          = st.session_state.get("_result_ticker",   bt_ticker)
         _bt_period_used  = st.session_state.get("_result_period",   "?")
         _bt_interval_used= st.session_state.get("_result_interval", "?")
@@ -1997,14 +2009,22 @@ with tabs[-1]:
 
         # ── Helper: render one dimension result ───────────────────────────
         def _render_dim(df_dim: pd.DataFrame, title: str, wr_thr: int,
-                        col_order: list, dim_key: str):
+                        col_order: list, dim_key: str, pnl_thr: float = 0.0):
             if df_dim.empty:
                 st.warning(f"{title}：無有效組合，請增加時間範圍或降低最少出現次數。")
                 return
 
+            # 篩選高勝率：勝率 ≥ wr_thr 且 平均盈虧 ≥ pnl_thr
             hi = df_dim[df_dim["勝率(%)"] >= wr_thr].copy()
+            if "平均盈虧(%)" in hi.columns and pnl_thr != 0.0:
+                hi = hi[hi["平均盈虧(%)"] >= pnl_thr]
+
             total = len(df_dim)
-            st.success(f"✅ {title}：找到 **{total}** 組，其中 **{len(hi)}** 組勝率 ≥ {wr_thr}%")
+            _pnl_cond_str = f" 且 平均盈虧 ≥ {pnl_thr}%" if pnl_thr != 0.0 else ""
+            st.success(
+                f"✅ {title}：找到 **{total}** 組，"
+                f"其中 **{len(hi)}** 組勝率 ≥ {wr_thr}%{_pnl_cond_str}"
+            )
 
             # Summary row
             m1, m2, m3 = st.columns(3)
@@ -2326,11 +2346,11 @@ with tabs[-1]:
         COLS_KL   = ["信號組合","K線形態","信號數量","勝率(%)","平均盈虧(%)","出現次數","方向"]
 
         with dim_tab1:
-            _render_dim(df_sig,  f"{_bt_lbl} 信號組合", _wr_thr, COLS_SIG, "sig")
+            _render_dim(df_sig,  f"{_bt_lbl} 信號組合",    _wr_thr, COLS_SIG, "sig", pnl_thr=_pnl_thr)
         with dim_tab2:
-            _render_dim(df_vol,  f"{_bt_lbl} 信號+成交量", _wr_thr, COLS_VOL, "vol")
+            _render_dim(df_vol,  f"{_bt_lbl} 信號+成交量", _wr_thr, COLS_VOL, "vol", pnl_thr=_pnl_thr)
         with dim_tab3:
-            _render_dim(df_kl,   f"{_bt_lbl} 信號+K線形態", _wr_thr, COLS_KL, "kl")
+            _render_dim(df_kl,   f"{_bt_lbl} 信號+K線形態",_wr_thr, COLS_KL,  "kl",  pnl_thr=_pnl_thr)
 
         # ── Best combo summary across all 3 dims ──────────────────────────
         st.markdown("---")
@@ -2338,6 +2358,8 @@ with tabs[-1]:
         all_hi = []
         for df_d, lbl in [(df_sig,"信號組合"),(df_vol,"信號+成交量"),(df_kl,"信號+K線形態")]:
             hi_d = df_d[df_d["勝率(%)"] >= _wr_thr] if not df_d.empty else pd.DataFrame()
+            if not hi_d.empty and "平均盈虧(%)" in hi_d.columns and _pnl_thr != 0.0:
+                hi_d = hi_d[hi_d["平均盈虧(%)"] >= _pnl_thr]
             if not hi_d.empty:
                 best_row = hi_d.iloc[0].copy()
                 best_row["_dim"] = lbl
