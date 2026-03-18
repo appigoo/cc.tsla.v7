@@ -30,6 +30,7 @@ import requests
 from itertools import combinations
 import time
 import traceback
+import json
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="📈 股票監控儀表板", layout="wide", page_icon="📈")
@@ -1098,11 +1099,129 @@ _TG_DEFAULT = pd.DataFrame({
     "回測勝率":   ["N/A","N/A","N/A","N/A","N/A"],
     "方向":       ["做多","做多","做多","做多","做多"],
 })
+# ── 條件表持久化：zlib 壓縮存 query_params + localStorage 雙重備援 ───────────
+# 方案說明：
+#   ① 主要：把條件表 JSON → zlib 壓縮 → base64 → query_params["tc"]
+#      30 行條件表壓縮後約 460 字元，遠低於瀏覽器 URL 限制（~8000 字元）
+#   ② 備援：同時透過 st.components.v1.html() 寫入瀏覽器 localStorage
+#      換瀏覽器 / 清 URL 後仍可從 localStorage 恢復
+#   恢復優先順序：localStorage（頁面載入 JS）→ query_params → 預設值
+
+import zlib, base64
+
+_TG_COLS = ["排名","異動標記","成交量標記","K線形態","回測勝率","方向"]
+_LS_KEY  = "streamlit_tg_conds"   # localStorage key name
+
+
+def _tg_encode(df: pd.DataFrame) -> str:
+    """DataFrame → zlib壓縮 → base64 字串（URL 安全）。"""
+    try:
+        records = df[_TG_COLS].fillna("").to_dict(orient="records")
+        raw     = json.dumps(records, ensure_ascii=False, separators=(",", ":"))
+        return base64.urlsafe_b64encode(
+            zlib.compress(raw.encode("utf-8"), level=9)
+        ).decode("ascii")
+    except Exception:
+        return ""
+
+
+def _tg_decode(s: str) -> pd.DataFrame:
+    """base64 字串 → zlib 解壓 → DataFrame。"""
+    try:
+        raw     = zlib.decompress(base64.urlsafe_b64decode(s)).decode("utf-8")
+        records = json.loads(raw)
+        df      = pd.DataFrame(records)
+        for col in _TG_COLS:
+            if col not in df.columns:
+                df[col] = "做多" if col == "方向" else ""
+        return df[_TG_COLS].fillna("")
+    except Exception:
+        return pd.DataFrame()
+
+
+def _tg_save(df: pd.DataFrame):
+    """
+    同時把條件表寫入：
+      ① query_params["tc"]（跨 session 恢復）
+      ② 瀏覽器 localStorage（跨 URL 恢復）
+    """
+    encoded = _tg_encode(df)
+    if not encoded:
+        return
+    # ① query_params
+    try:
+        st.query_params["tc"] = encoded
+    except Exception:
+        pass
+    # ② localStorage（高度 0 的隱形 component）
+    try:
+        import streamlit.components.v1 as components
+        _ls_js = f"""
+        <script>
+        try {{
+            localStorage.setItem("{_LS_KEY}", {json.dumps(encoded)});
+        }} catch(e) {{}}
+        </script>
+        """
+        components.html(_ls_js, height=0, scrolling=False)
+    except Exception:
+        pass
+
+
+def _tg_load_ls_component():
+    """
+    渲染一個隱形 component：
+      讀取 localStorage 中的條件表，
+      若存在且比 query_params 更新，則把值注入 query_params 並 rerun。
+    只在 session 剛初始化（tg_conds 不在 session_state）時執行一次。
+    """
+    try:
+        import streamlit.components.v1 as components
+        _cur_qp = st.query_params.get("tc", "")
+        _ls_read_js = f"""
+        <script>
+        (function() {{
+            var ls = "";
+            try {{ ls = localStorage.getItem("{_LS_KEY}") || ""; }} catch(e) {{}}
+            var qp = {json.dumps(_cur_qp)};
+            // 只有 localStorage 有值而 query_params 沒有時才注入
+            if (ls && ls !== qp) {{
+                var url = new URL(window.parent.location.href);
+                url.searchParams.set("tc", ls);
+                window.parent.history.replaceState(null, "", url.toString());
+                // 觸發 Streamlit rerun（更新 URL 後 Streamlit 會自動 rerun）
+                window.parent.location.reload();
+            }}
+        }})();
+        </script>
+        """
+        components.html(_ls_read_js, height=0, scrolling=False)
+    except Exception:
+        pass
+
+
+# ── 初始化順序：① query_params → ② 預設值 ───────────────────────────────────
 if "tg_conds" not in st.session_state:
-    st.session_state["tg_conds"] = _TG_DEFAULT.copy()
-elif "方向" not in st.session_state["tg_conds"].columns:
-    # 向後相容：舊版 session_state 沒有方向欄，補上預設值「做多」
-    st.session_state["tg_conds"]["方向"] = ""
+    # 若 query_params 沒有值，先讓 localStorage component 嘗試注入
+    _qp_encoded = st.query_params.get("tc", "")
+    if _qp_encoded:
+        _restored = _tg_decode(_qp_encoded)
+        if not _restored.empty:
+            st.session_state["tg_conds"] = _restored
+        else:
+            st.session_state["tg_conds"] = _TG_DEFAULT.copy()
+            _tg_load_ls_component()
+    else:
+        # 沒有 query_params → 嘗試從 localStorage 恢復
+        st.session_state["tg_conds"] = _TG_DEFAULT.copy()
+        _tg_load_ls_component()
+
+# 向後相容：補齊缺少欄位
+_cur = st.session_state["tg_conds"]
+for _col in _TG_COLS:
+    if _col not in _cur.columns:
+        _cur[_col] = "做多" if _col == "方向" else ""
+st.session_state["tg_conds"] = _cur
 
 telegram_conditions = st.data_editor(
     st.session_state["tg_conds"],
@@ -1126,6 +1245,8 @@ _tc = telegram_conditions.copy()
 for _col in _tc.columns:
     _tc[_col] = _tc[_col].where(_tc[_col].notna(), "").astype(str).str.strip()
 st.session_state["tg_conds"] = _tc
+# 持久化：把最新條件表寫入 query_params + localStorage
+_tg_save(_tc)
 
 st.title("📊 股票監控儀表板")
 st.caption(f"⏱ 更新時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -2318,8 +2439,10 @@ with tabs[-1]:
 
             if "方向" not in combined.columns:
                 combined["方向"] = ""
-            st.session_state["tg_conds"] = combined[
+            _oc_saved = combined[
                 ["排名","異動標記","成交量標記","K線形態","回測勝率","方向"]]
+            st.session_state["tg_conds"] = _oc_saved
+            _tg_save(_oc_saved)
 
             added = len(combined) - len(
                 existing.drop_duplicates(subset=["異動標記","成交量標記","K線形態"]))
@@ -2516,7 +2639,9 @@ with tabs[-1]:
             help="此操作將清除現有條件表所有內容，以三維合併結果取代",
         ):
             # 執行覆蓋
-            st.session_state["tg_conds"] = _preview_df.copy()
+            _merged_saved = _preview_df.copy()
+            st.session_state["tg_conds"] = _merged_saved
+            _tg_save(_merged_saved)
             _old_count = len(st.session_state.get("tg_conds", pd.DataFrame()))
             st.success(
                 f"🎯 **覆蓋完成！** Telegram 觸發條件表已更新為三維合併結果。\n\n"
